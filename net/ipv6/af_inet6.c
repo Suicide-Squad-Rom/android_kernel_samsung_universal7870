@@ -444,11 +444,9 @@ void inet6_destroy_sock(struct sock *sk)
 
 	/* Free tx options */
 
-	opt = xchg((__force struct ipv6_txoptions **)&np->opt, NULL);
-	if (opt) {
-		atomic_sub(opt->tot_len, &sk->sk_omem_alloc);
-		txopt_put(opt);
-	}
+	opt = xchg(&np->opt, NULL);
+	if (opt != NULL)
+		sock_kfree_s(sk, opt, opt->tot_len);
 }
 EXPORT_SYMBOL_GPL(inet6_destroy_sock);
 
@@ -695,10 +693,7 @@ int inet6_sk_rebuild_header(struct sock *sk)
 		fl6.flowi6_uid = sk->sk_uid;
 		security_sk_classify_flow(sk, flowi6_to_flowi(&fl6));
 
-		rcu_read_lock();
-		final_p = fl6_update_dst(&fl6, rcu_dereference(np->opt),
-					 &final);
-		rcu_read_unlock();
+		final_p = fl6_update_dst(&fl6, np->opt, &final);
 
 		dst = ip6_dst_lookup_flow(sk, &fl6, final_p);
 		if (IS_ERR(dst)) {
@@ -921,12 +916,12 @@ static int __init inet6_init(void)
 	err = register_pernet_subsys(&inet6_net_ops);
 	if (err)
 		goto register_pernet_fail;
-	err = ip6_mr_init();
-	if (err)
-		goto ipmr_fail;
 	err = icmpv6_init();
 	if (err)
 		goto icmp_fail;
+	err = ip6_mr_init();
+	if (err)
+		goto ipmr_fail;
 	err = ndisc_init();
 	if (err)
 		goto ndisc_fail;
@@ -1044,10 +1039,10 @@ igmp_fail:
 	ndisc_cleanup();
 ndisc_fail:
 	ip6_mr_cleanup();
-icmp_fail:
-	unregister_pernet_subsys(&inet6_net_ops);
 ipmr_fail:
 	icmpv6_cleanup();
+icmp_fail:
+	unregister_pernet_subsys(&inet6_net_ops);
 register_pernet_fail:
 	sock_unregister(PF_INET6);
 	rtnl_unregister_all(PF_INET6);

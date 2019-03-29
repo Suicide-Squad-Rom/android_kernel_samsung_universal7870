@@ -128,8 +128,6 @@ struct n_tty_data {
 	struct mutex output_lock;
 };
 
-#define MASK(x) ((x) & (N_TTY_BUF_SIZE - 1))
-
 static inline size_t read_cnt(struct n_tty_data *ldata)
 {
 	return ldata->read_head - ldata->read_tail;
@@ -187,31 +185,6 @@ static int receive_room(struct tty_struct *tty)
 		left = ldata->icanon && ldata->canon_head == ldata->read_tail;
 
 	return left;
-}
-
-/* If we are not echoing the data, perhaps this is a secret so erase it */
-static inline void zero_buffer(struct tty_struct *tty, u8 *buffer, int size)
-{
-	bool icanon = !!L_ICANON(tty);
-	bool no_echo = !L_ECHO(tty);
-
-	if (icanon && no_echo)
-		memset(buffer, 0x00, size);
-}
-
-static inline int tty_copy_to_user(struct tty_struct *tty,
-					void __user *to,
-					void *from,
-					unsigned long n)
-{
-	struct n_tty_data *ldata = tty->disc_data;
-	int retval;
-
-	tty_audit_add_data(tty, from, n, ldata->icanon);
-	retval = copy_to_user(to, from, n);
-	if (!retval)
-		zero_buffer(tty, from, n);
-	return retval;
 }
 
 /**
@@ -294,13 +267,16 @@ static void n_tty_check_throttle(struct tty_struct *tty)
 
 static void n_tty_check_unthrottle(struct tty_struct *tty)
 {
-	if (tty->driver->type == TTY_DRIVER_TYPE_PTY) {
+	if (tty->driver->type == TTY_DRIVER_TYPE_PTY &&
+	    tty->link->ldisc->ops->write_wakeup == n_tty_write_wakeup) {
 		if (chars_in_buffer(tty) > TTY_THRESHOLD_UNTHROTTLE)
 			return;
 		if (!tty->count)
 			return;
 		n_tty_set_room(tty);
-		tty_wakeup(tty->link);
+		n_tty_write_wakeup(tty->link);
+		if (waitqueue_active(&tty->link->write_wait))
+			wake_up_interruptible_poll(&tty->link->write_wait, POLLOUT);
 		return;
 	}
 
@@ -375,7 +351,8 @@ static void n_tty_packet_mode_flush(struct tty_struct *tty)
 	spin_lock_irqsave(&tty->ctrl_lock, flags);
 	if (tty->link->packet) {
 		tty->ctrl_status |= TIOCPKT_FLUSHREAD;
-		wake_up_interruptible(&tty->link->read_wait);
+		if (waitqueue_active(&tty->link->read_wait))
+			wake_up_interruptible(&tty->link->read_wait);
 	}
 	spin_unlock_irqrestore(&tty->ctrl_lock, flags);
 }
@@ -1042,15 +1019,14 @@ static void eraser(unsigned char c, struct tty_struct *tty)
 	}
 
 	seen_alnums = 0;
-	while (MASK(ldata->read_head) != MASK(ldata->canon_head)) {
+	while (ldata->read_head != ldata->canon_head) {
 		head = ldata->read_head;
 
 		/* erase a single possibly multibyte character */
 		do {
 			head--;
 			c = read_buf(ldata, head);
-		} while (is_continuation(c, tty) &&
-			 MASK(head) != MASK(ldata->canon_head));
+		} while (is_continuation(c, tty) && head != ldata->canon_head);
 
 		/* do not partially erase */
 		if (is_continuation(c, tty))
@@ -1092,7 +1068,7 @@ static void eraser(unsigned char c, struct tty_struct *tty)
 				 * This info is used to go back the correct
 				 * number of columns.
 				 */
-				while (MASK(tail) != MASK(ldata->canon_head)) {
+				while (tail != ldata->canon_head) {
 					tail--;
 					c = read_buf(ldata, tail);
 					if (c == '\t') {
@@ -1350,7 +1326,7 @@ n_tty_receive_char_special(struct tty_struct *tty, unsigned char c)
 			finish_erasing(ldata);
 			echo_char(c, tty);
 			echo_char_raw('\n', ldata);
-			while (MASK(tail) != MASK(ldata->read_head)) {
+			while (tail != ldata->read_head) {
 				echo_char(read_buf(ldata, tail), tty);
 				tail++;
 			}
@@ -1392,7 +1368,8 @@ handle_newline:
 			put_tty_queue(c, ldata);
 			smp_store_release(&ldata->canon_head, ldata->read_head);
 			kill_fasync(&tty->fasync, SIGIO, POLL_IN);
-			wake_up_interruptible_poll(&tty->read_wait, POLLIN);
+			if (waitqueue_active(&tty->read_wait))
+				wake_up_interruptible_poll(&tty->read_wait, POLLIN);
 			return 0;
 		}
 	}
@@ -1678,7 +1655,8 @@ static void __receive_buf(struct tty_struct *tty, const unsigned char *cp,
 
 	if ((read_cnt(ldata) >= ldata->minimum_to_wake) || L_EXTPROC(tty)) {
 		kill_fasync(&tty->fasync, SIGIO, POLL_IN);
-		wake_up_interruptible_poll(&tty->read_wait, POLLIN);
+		if (waitqueue_active(&tty->read_wait))
+			wake_up_interruptible_poll(&tty->read_wait, POLLIN);
 	}
 }
 
@@ -1820,7 +1798,7 @@ static void n_tty_set_termios(struct tty_struct *tty, struct ktermios *old)
 {
 	struct n_tty_data *ldata = tty->disc_data;
 
-	if (!old || (old->c_lflag ^ tty->termios.c_lflag) & (ICANON | EXTPROC)) {
+	if (!old || (old->c_lflag ^ tty->termios.c_lflag) & ICANON) {
 		bitmap_zero(ldata->read_flags, N_TTY_BUF_SIZE);
 		ldata->line_start = ldata->read_tail;
 		if (!L_ICANON(tty) || !read_cnt(ldata)) {
@@ -1897,8 +1875,10 @@ static void n_tty_set_termios(struct tty_struct *tty, struct ktermios *old)
 	}
 
 	/* The termios change make the tty ready for I/O */
-	wake_up_interruptible(&tty->write_wait);
-	wake_up_interruptible(&tty->read_wait);
+	if (waitqueue_active(&tty->write_wait))
+		wake_up_interruptible(&tty->write_wait);
+	if (waitqueue_active(&tty->read_wait))
+		wake_up_interruptible(&tty->read_wait);
 }
 
 /**
@@ -2016,7 +1996,6 @@ static int copy_from_read_buf(struct tty_struct *tty,
 		is_eof = n == 1 && read_buf(ldata, tail) == EOF_CHAR(tty);
 		tty_audit_add_data(tty, read_buf_addr(ldata, tail), n,
 				ldata->icanon);
-		zero_buffer(tty, read_buf_addr(ldata, tail), n);
 		smp_store_release(&ldata->read_tail, ldata->read_tail + n);
 		/* Turn single EOF into zero-length read */
 		if (L_EXTPROC(tty) && ldata->icanon && is_eof &&
@@ -2099,12 +2078,12 @@ static int canon_copy_from_read_buf(struct tty_struct *tty,
 		    __func__, eol, found, n, c, size, more);
 
 	if (n > size) {
-		ret = tty_copy_to_user(tty, *b, read_buf_addr(ldata, tail), size);
+		ret = copy_to_user(*b, read_buf_addr(ldata, tail), size);
 		if (ret)
 			return -EFAULT;
-		ret = tty_copy_to_user(tty, *b + size, ldata->read_buf, n - size);
+		ret = copy_to_user(*b + size, ldata->read_buf, n - size);
 	} else
-		ret = tty_copy_to_user(tty, *b, read_buf_addr(ldata, tail), n);
+		ret = copy_to_user(*b, read_buf_addr(ldata, tail), n);
 
 	if (ret)
 		return -EFAULT;
@@ -2483,12 +2462,17 @@ static unsigned int n_tty_poll(struct tty_struct *tty, struct file *file,
 
 	poll_wait(file, &tty->read_wait, wait);
 	poll_wait(file, &tty->write_wait, wait);
-	if (input_available_p(tty, 1))
-		mask |= POLLIN | POLLRDNORM;
-	if (tty->packet && tty->link->ctrl_status)
-		mask |= POLLPRI | POLLIN | POLLRDNORM;
 	if (test_bit(TTY_OTHER_CLOSED, &tty->flags))
 		mask |= POLLHUP;
+	if (input_available_p(tty, 1))
+		mask |= POLLIN | POLLRDNORM;
+	else if (mask & POLLHUP) {
+		tty_flush_to_ldisc(tty);
+		if (input_available_p(tty, 1))
+			mask |= POLLIN | POLLRDNORM;
+	}
+	if (tty->packet && tty->link->ctrl_status)
+		mask |= POLLPRI | POLLIN | POLLRDNORM;
 	if (tty_hung_up_p(file))
 		mask |= POLLHUP;
 	if (!(mask & (POLLHUP | POLLIN | POLLRDNORM))) {
@@ -2514,7 +2498,7 @@ static unsigned long inq_canon(struct n_tty_data *ldata)
 	tail = ldata->read_tail;
 	nr = head - tail;
 	/* Skip EOF-chars.. */
-	while (MASK(head) != MASK(tail)) {
+	while (head != tail) {
 		if (test_bit(tail & (N_TTY_BUF_SIZE - 1), ldata->read_flags) &&
 		    read_buf(ldata, tail) == __DISABLED_CHAR)
 			nr--;
@@ -2534,7 +2518,7 @@ static int n_tty_ioctl(struct tty_struct *tty, struct file *file,
 		return put_user(tty_chars_in_buffer(tty), (int __user *) arg);
 	case TIOCINQ:
 		down_write(&tty->termios_rwsem);
-		if (L_ICANON(tty) && !L_EXTPROC(tty))
+		if (L_ICANON(tty))
 			retval = inq_canon(ldata);
 		else
 			retval = read_cnt(ldata);

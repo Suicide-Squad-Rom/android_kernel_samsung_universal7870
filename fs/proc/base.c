@@ -95,8 +95,6 @@
 #include "internal.h"
 #include "fd.h"
 
-#include "../../lib/kstrtox.h"
-
 /* NOTE:
  *	Implementing inode permission operations in /proc is almost
  *	certainly an error.  Permission checks need to happen during
@@ -214,7 +212,7 @@ static int proc_pid_cmdline(struct seq_file *m, struct pid_namespace *ns,
 static int proc_pid_auxv(struct seq_file *m, struct pid_namespace *ns,
 			 struct pid *pid, struct task_struct *task)
 {
-	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+	struct mm_struct *mm = mm_access(task, PTRACE_MODE_READ);
 	if (mm && !IS_ERR(mm)) {
 		unsigned int nwords = 0;
 		do {
@@ -242,7 +240,7 @@ static int proc_pid_wchan(struct seq_file *m, struct pid_namespace *ns,
 	wchan = get_wchan(task);
 
 	if (lookup_symbol_name(wchan, symname) < 0)
-		if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+		if (!ptrace_may_access(task, PTRACE_MODE_READ))
 			return 0;
 		else
 			return seq_printf(m, "%lu", wchan);
@@ -256,7 +254,7 @@ static int lock_trace(struct task_struct *task)
 	int err = mutex_lock_killable(&task->signal->cred_guard_mutex);
 	if (err)
 		return err;
-	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH_FSCREDS)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_ATTACH)) {
 		mutex_unlock(&task->signal->cred_guard_mutex);
 		return -EPERM;
 	}
@@ -279,20 +277,6 @@ static int proc_pid_stack(struct seq_file *m, struct pid_namespace *ns,
 	unsigned long *entries;
 	int err;
 	int i;
-
-	/*
-	 * The ability to racily run the kernel stack unwinder on a running task
-	 * and then observe the unwinder output is scary; while it is useful for
-	 * debugging kernel issues, it can also allow an attacker to leak kernel
-	 * stack contents.
-	 * Doing this in a manner that is at least safe from races would require
-	 * some work to ensure that the remote task can not be scheduled; and
-	 * even then, this would still expose the unwinder as local attack
-	 * surface.
-	 * Therefore, this interface is restricted to root.
-	 */
-	if (!file_ns_capable(m->file, &init_user_ns, CAP_SYS_ADMIN))
-		return -EACCES;
 
 	entries = kmalloc(MAX_STACK_TRACE_DEPTH * sizeof(*entries), GFP_KERNEL);
 	if (!entries)
@@ -513,7 +497,7 @@ static int proc_fd_access_allowed(struct inode *inode)
 	 */
 	task = get_proc_task(inode);
 	if (task) {
-		allowed = ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+		allowed = ptrace_may_access(task, PTRACE_MODE_READ);
 		put_task_struct(task);
 	}
 	return allowed;
@@ -548,7 +532,7 @@ static bool has_pid_permissions(struct pid_namespace *pid,
 		return true;
 	if (in_group_p(pid->pid_gid))
 		return true;
-	return ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS);
+	return ptrace_may_access(task, PTRACE_MODE_READ);
 }
 
 
@@ -625,7 +609,7 @@ struct mm_struct *proc_mem_open(struct inode *inode, unsigned int mode)
 	struct mm_struct *mm = ERR_PTR(-ESRCH);
 
 	if (task) {
-		mm = mm_access(task, mode | PTRACE_MODE_FSCREDS);
+		mm = mm_access(task, mode);
 		put_task_struct(task);
 
 		if (!IS_ERR_OR_NULL(mm)) {
@@ -1659,33 +1643,8 @@ end_instantiate:
 static int dname_to_vma_addr(struct dentry *dentry,
 			     unsigned long *start, unsigned long *end)
 {
-	const char *str = dentry->d_name.name;
-	unsigned long long sval, eval;
-	unsigned int len;
-
-	len = _parse_integer(str, 16, &sval);
-	if (len & KSTRTOX_OVERFLOW)
+	if (sscanf(dentry->d_name.name, "%lx-%lx", start, end) != 2)
 		return -EINVAL;
-	if (sval != (unsigned long)sval)
-		return -EINVAL;
-	str += len;
-
-	if (*str != '-')
-		return -EINVAL;
-	str++;
-
-	len = _parse_integer(str, 16, &eval);
-	if (len & KSTRTOX_OVERFLOW)
-		return -EINVAL;
-	if (eval != (unsigned long)eval)
-		return -EINVAL;
-	str += len;
-
-	if (*str != '\0')
-		return -EINVAL;
-
-	*start = sval;
-	*end = eval;
 
 	return 0;
 }
@@ -1713,7 +1672,7 @@ static int map_files_d_revalidate(struct dentry *dentry, unsigned int flags)
 	if (!task)
 		goto out_notask;
 
-	mm = mm_access(task, PTRACE_MODE_READ_FSCREDS);
+	mm = mm_access(task, PTRACE_MODE_READ);
 	if (IS_ERR_OR_NULL(mm))
 		goto out;
 
@@ -1845,7 +1804,7 @@ static struct dentry *proc_map_files_lookup(struct inode *dir,
 		goto out;
 
 	result = -EACCES;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ))
 		goto out_put_task;
 
 	result = -ENOENT;
@@ -1902,7 +1861,7 @@ proc_map_files_readdir(struct file *file, struct dir_context *ctx)
 		goto out;
 
 	ret = -EACCES;
-	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS))
+	if (!ptrace_may_access(task, PTRACE_MODE_READ))
 		goto out_put_task;
 
 	ret = 0;
@@ -2381,7 +2340,7 @@ static int do_io_accounting(struct task_struct *task, struct seq_file *m, int wh
 	if (result)
 		return result;
 
-	if (!ptrace_may_access(task, PTRACE_MODE_READ_FSCREDS)) {
+	if (!ptrace_may_access(task, PTRACE_MODE_READ)) {
 		result = -EACCES;
 		goto out_unlock;
 	}

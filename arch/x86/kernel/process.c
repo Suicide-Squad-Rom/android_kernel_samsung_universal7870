@@ -29,7 +29,6 @@
 #include <asm/fpu-internal.h>
 #include <asm/debugreg.h>
 #include <asm/nmi.h>
-#include <asm/tlbflush.h>
 
 /*
  * per-CPU TSS segments. Threads are completely 'soft' on Linux,
@@ -130,7 +129,7 @@ void flush_thread(void)
 
 static void hard_disable_TSC(void)
 {
-	cr4_set_bits(X86_CR4_TSD);
+	write_cr4(read_cr4() | X86_CR4_TSD);
 }
 
 void disable_TSC(void)
@@ -147,7 +146,7 @@ void disable_TSC(void)
 
 static void hard_enable_TSC(void)
 {
-	cr4_clear_bits(X86_CR4_TSD);
+	write_cr4(read_cr4() & ~X86_CR4_TSD);
 }
 
 static void enable_TSC(void)
@@ -417,7 +416,6 @@ static int prefer_mwait_c1_over_halt(const struct cpuinfo_x86 *c)
 static void mwait_idle(void)
 {
 	if (!current_set_polling_and_test()) {
-		trace_cpu_idle_rcuidle(1, smp_processor_id());
 		if (this_cpu_has(X86_BUG_CLFLUSH_MONITOR)) {
 			smp_mb(); /* quirk */
 			clflush((void *)&current_thread_info()->flags);
@@ -429,7 +427,6 @@ static void mwait_idle(void)
 			__sti_mwait(0, 0);
 		else
 			local_irq_enable();
-		trace_cpu_idle_rcuidle(PWR_EVENT_EXIT, smp_processor_id());
 	} else {
 		local_irq_enable();
 	}
